@@ -570,7 +570,7 @@ wheels = [
 
 [[package]]
 name = "habemus-papadum-hydra"
-version = "0.2.0a0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "hydra-core" },
