@@ -52,6 +52,7 @@ dev = [
     "inquirerpy>=0.3.4",
     "pre-commit>=3.7.0",
     "watchdog>=3.0.0",
+    "hatchling>=1.27.0",
 ]
 
 [tool.ruff]

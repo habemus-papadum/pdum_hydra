@@ -580,6 +580,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "hatch" },
+    { name = "hatchling" },
     { name = "inquirerpy" },
     { name = "jupyter" },
     { name = "mkdocs" },
@@ -604,6 +605,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "hatch", specifier = ">=1.14.2" },
+    { name = "hatchling", specifier = ">=1.27.0" },
     { name = "inquirerpy", specifier = ">=0.3.4" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "mkdocs", specifier = ">=1.6.1" },

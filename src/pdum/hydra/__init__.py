@@ -260,6 +260,7 @@ def generate_sweep_configs(*,
     overrides : List[str], optional
         List of Hydra override strings to apply to the base configuration.
         Examples: ["lr=0.01,0.1", "model=resnet,vgg"]. Default is None.
+        To use sweep files, include "+sweeps=<sweep_name>" in overrides.
     config_name : str, optional
         Name of the config file (without extension) to load. Default is "config".
     config_dir : str or Path, optional
@@ -273,9 +274,36 @@ def generate_sweep_configs(*,
         Object containing the base configuration, override mappings, and all
         generated run configurations.
 
+    Notes
+    -----
+    Sweep files provide a powerful way to define parameter sweeps. Place YAML
+    files in the `{config_dir}/sweeps/` directory with a `parameters` section.
+
+    - **Array values** create sweep dimensions (cartesian product)
+    - **Scalar values** are applied to all runs without sweeping
+
+    Array syntax (creates sweep dimension)::
+
+        parameters:
+          training.lr: [0.001, 0.01, 0.1]
+          model.name: [resnet, vgg]
+
+    Alternative array syntax::
+
+        parameters:
+          competition:
+            - random-acts-of-pizza
+            - taxi-fare-prediction
+
+    Scalar values (no sweep, applied to all runs)::
+
+        parameters:
+          training.epochs: 100
+          agent.temperature: 1.0
+
     Examples
     --------
-    >>> # Generate sweep from config directory with overrides
+    >>> # Generate sweep from command-line overrides
     >>> runs = generate_sweep_configs(
     ...     overrides=["lr=0.001,0.01", "batch_size=16,32"],
     ...     config_dir="/path/to/config"
@@ -285,10 +313,35 @@ def generate_sweep_configs(*,
     >>> print(runs.override_map)
     {'lr': [0.001, 0.01], 'batch_size': [16, 32]}
 
+    >>> # Use a sweep file: config/sweeps/my_sweep.yaml
+    >>> # File contents:
+    >>> # parameters:
+    >>> #   trial: [0, 1, 2, 3, 4]
+    >>> #   model: [resnet, vgg, alexnet]
+    >>> #   lr: [0.001, 0.01]
+    >>> #   batch_size: 32  # scalar, no sweep
+    >>>
+    >>> runs = generate_sweep_configs(
+    ...     overrides=["+sweeps=my_sweep"],
+    ...     config_dir="/path/to/config"
+    ... )
+    >>> print(len(runs.runs))  # 5 trials × 3 models × 2 lrs = 30
+    30
+
     >>> # Access individual run configurations
     >>> for run in runs.runs:
     ...     print(run.override_dict)
+    ...     # All runs have batch_size=32 (scalar value)
     ...     # Use run.config to access the full OmegaConf DictConfig
+    ...     train_model(run.config)
+
+    >>> # Combine sweep file with additional overrides
+    >>> runs = generate_sweep_configs(
+    ...     overrides=["+sweeps=my_sweep", "optimizer=adam,sgd"],
+    ...     config_dir="/path/to/config"
+    ... )
+    >>> print(len(runs.runs))  # 30 × 2 optimizers = 60
+    60
     """
     if overrides is None:
         overrides = []

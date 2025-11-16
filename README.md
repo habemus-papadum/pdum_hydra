@@ -26,6 +26,8 @@ uv pip install habemus-papadum-hydra
 
 ## Usage
 
+### Basic Parameter Sweeps
+
 ```python
 from pdum.hydra import generate_sweep_configs
 
@@ -47,6 +49,70 @@ for run in runs.runs:
 # Inspect the sweep parameters
 print(f"Total runs: {len(runs.runs)}")  # 6 runs (3 lr × 2 layers)
 print(f"Sweep parameters: {runs.override_map}")
+```
+
+### Using Sweep Files
+
+For complex sweeps, use sweep configuration files. Create a file `config/sweeps/experiment.yaml`:
+
+```yaml
+parameters:
+  # Arrays create sweep dimensions (cartesian product)
+  trial: [0, 1, 2, 3, 4]
+  competition:
+    - random-acts-of-pizza
+    - new-york-city-taxi-fare-prediction
+    - tabular-playground-series-may-2022
+  agent.code.model:
+    - o1
+    - o3-mini
+    - o1-mini
+
+  # Scalar values are applied to all runs (no sweep)
+  limits.steps: 500
+  agent.search.max_debug_depth: 20
+  agent.search.num_drafts: 5
+  limits.code_execution_time: 32400
+  agent.code.temp: 1.0
+  agent.k_fold_validation: 5
+  limits.total_time: 86400
+```
+
+Then use it in your code:
+
+```python
+# Load sweep from file
+runs = generate_sweep_configs(
+    overrides=["+sweeps=experiment"],
+    config_dir="path/to/config"
+)
+
+# This generates 5 trials × 3 competitions × 3 models = 45 runs
+print(f"Total runs: {len(runs.runs)}")  # 45
+
+# All runs share the same scalar values
+for run in runs.runs:
+    assert run.config.limits.steps == 500
+    assert run.config.agent.code.temp == 1.0
+    # But have different sweep parameter values
+    print(f"Trial {run.config.trial}, Model: {run.config.agent.code.model}")
+```
+
+### Combining Sweep Files with Overrides
+
+You can combine sweep files with additional command-line overrides:
+
+```python
+runs = generate_sweep_configs(
+    overrides=[
+        "+sweeps=experiment",  # Load base sweep
+        "optimizer=adam,sgd"    # Add another sweep dimension
+    ],
+    config_dir="path/to/config"
+)
+
+# Now: 45 runs × 2 optimizers = 90 runs
+print(f"Total runs: {len(runs.runs)}")  # 90
 ```
 
 ## Development

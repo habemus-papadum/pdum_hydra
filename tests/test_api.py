@@ -85,6 +85,80 @@ training:
     return config_dir
 
 
+@pytest.fixture
+def advanced_sweep_config_dir(tmp_path):
+    """Create a config directory with advanced sweep configurations using arrays and ranges."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+
+    # Create base config
+    config_file = config_dir / "config.yaml"
+    config_file.write_text("""
+agent:
+  code:
+    model: gpt-4
+    temp: 0.7
+  search:
+    max_debug_depth: 10
+    num_drafts: 3
+  k_fold_validation: 3
+
+limits:
+  steps: 100
+  code_execution_time: 3600
+  total_time: 7200
+
+training:
+  lr: 0.01
+  batch_size: 32
+  optimizer: sgd
+
+model:
+  name: default
+
+competition: default-competition
+trial: 0
+""")
+
+    # Create sweeps directory
+    sweeps_dir = config_dir / "sweeps"
+    sweeps_dir.mkdir()
+
+    # Create a comprehensive sweep config with arrays and scalar values
+    sweep_file = sweeps_dir / "comprehensive.yaml"
+    sweep_file.write_text("""
+parameters:
+  trial: [0, 1, 2, 3, 4]
+  competition:
+    - random-acts-of-pizza
+    - new-york-city-taxi-fare-prediction
+    - tabular-playground-series-may-2022
+  agent.code.model:
+    - o1
+    - o3-mini
+    - o1-mini
+  limits.steps: 500
+  agent.search.max_debug_depth: 20
+  agent.search.num_drafts: 5
+  limits.code_execution_time: 32400
+  agent.code.temp: 1.0
+  agent.k_fold_validation: 5
+  limits.total_time: 86400
+""")
+
+    # Create a sweep with mixed arrays
+    sweep_file2 = sweeps_dir / "mixed.yaml"
+    sweep_file2.write_text("""
+parameters:
+  training.lr: [0.001, 0.01, 0.1]
+  training.batch_size: [16, 32, 64]
+  training.optimizer: adam
+  model.name: [resnet, vgg]
+""")
+
+    return config_dir
+
+
 class TestRunConfig:
     """Test suite for RunConfig dataclass."""
 
@@ -330,6 +404,112 @@ class TestGenerateSweepConfigs:
 
         assert isinstance(result, GeneratedRuns)
         assert len(result.runs) == 1
+
+    def test_sweep_file_with_arrays(self, advanced_sweep_config_dir):
+        """Test sweep file with array parameters creating sweep dimensions."""
+        result = generate_sweep_configs(
+            overrides=["+sweeps=mixed"],
+            config_dir=advanced_sweep_config_dir,
+            config_name="config"
+        )
+
+        # 3 lr × 3 batch_size × 2 model.name = 18 runs
+        assert len(result.runs) == 18
+
+        # Check that sweep dimensions are in override_map
+        assert "training.lr" in result.override_map
+        assert "training.batch_size" in result.override_map
+        assert "model.name" in result.override_map
+
+        # Verify the sweep values
+        assert set(result.override_map["training.lr"]) == {0.001, 0.01, 0.1}
+        assert set(result.override_map["training.batch_size"]) == {16, 32, 64}
+        assert set(result.override_map["model.name"]) == {"resnet", "vgg"}
+
+        # Verify all runs have the scalar value applied
+        for run in result.runs:
+            assert run.config.training.optimizer == "adam"
+
+    def test_sweep_file_with_scalars_and_arrays(self, advanced_sweep_config_dir):
+        """Test sweep file with both scalar values and array sweep parameters."""
+        result = generate_sweep_configs(
+            overrides=["+sweeps=comprehensive"],
+            config_dir=advanced_sweep_config_dir,
+            config_name="config"
+        )
+
+        # 5 trials × 3 competitions × 3 models = 45 runs
+        assert len(result.runs) == 45
+
+        # Check sweep dimensions
+        assert "trial" in result.override_map
+        assert "competition" in result.override_map
+        assert "agent.code.model" in result.override_map
+
+        # Verify sweep values
+        assert result.override_map["trial"] == [0, 1, 2, 3, 4]
+        assert set(result.override_map["competition"]) == {
+            "random-acts-of-pizza",
+            "new-york-city-taxi-fare-prediction",
+            "tabular-playground-series-may-2022"
+        }
+        assert set(result.override_map["agent.code.model"]) == {"o1", "o3-mini", "o1-mini"}
+
+        # Verify scalar values are applied to all runs
+        for run in result.runs:
+            assert run.config.limits.steps == 500
+            assert run.config.agent.search.max_debug_depth == 20
+            assert run.config.agent.search.num_drafts == 5
+            assert run.config.limits.code_execution_time == 32400
+            assert run.config.agent.code.temp == 1.0
+            assert run.config.agent.k_fold_validation == 5
+            assert run.config.limits.total_time == 86400
+
+    def test_sweep_file_cartesian_product(self, advanced_sweep_config_dir):
+        """Test that sweep file arrays create cartesian product."""
+        result = generate_sweep_configs(
+            overrides=["+sweeps=comprehensive"],
+            config_dir=advanced_sweep_config_dir,
+            config_name="config"
+        )
+
+        # Verify we have all combinations
+        combinations = set()
+        for run in result.runs:
+            combo = (
+                run.config.trial,
+                run.config.competition,
+                run.config.agent.code.model
+            )
+            combinations.add(combo)
+
+        # Should have 5 × 3 × 3 = 45 unique combinations
+        assert len(combinations) == 45
+
+        # Verify specific combinations exist
+        assert (0, "random-acts-of-pizza", "o1") in combinations
+        assert (4, "tabular-playground-series-may-2022", "o1-mini") in combinations
+
+    def test_sweep_file_override_dict_with_arrays(self, advanced_sweep_config_dir):
+        """Test that override_dict is correctly populated for sweep files with arrays."""
+        result = generate_sweep_configs(
+            overrides=["+sweeps=mixed"],
+            config_dir=advanced_sweep_config_dir,
+            config_name="config"
+        )
+
+        # Check each run has correct override_dict
+        for run in result.runs:
+            assert "training.lr" in run.override_dict
+            assert "training.batch_size" in run.override_dict
+            assert "model.name" in run.override_dict
+            assert "training.optimizer" in run.override_dict
+
+            # Verify values are from the sweep
+            assert run.override_dict["training.lr"] in [0.001, 0.01, 0.1]
+            assert run.override_dict["training.batch_size"] in [16, 32, 64]
+            assert run.override_dict["model.name"] in ["resnet", "vgg"]
+            assert run.override_dict["training.optimizer"] == "adam"
 
 
 class TestDynamicLoadConfig:
