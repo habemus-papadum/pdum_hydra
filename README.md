@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
-Hydra utils
+A streamlined library for managing Hydra configurations with first-class support for parameter sweeps. Built on top of the [Hydra](https://hydra.cc/) framework, `pdum.hydra` simplifies sweep generation and configuration management for machine learning experiments. Generate all combinations of hyperparameters with ease, iterate over configurations programmatically, and manage complex experimental setups without the overhead of Hydra's CLI and job launching features. Perfect for ML experimentation workflows that need structured configs with powerful sweep capabilities.
 
 ## Installation
 
@@ -27,9 +27,26 @@ uv pip install habemus-papadum-hydra
 ## Usage
 
 ```python
-from pdum import hydra
+from pdum.hydra import generate_sweep_configs
 
-print(hydra.__version__)
+# Generate sweep from config directory with parameter sweeps
+runs = generate_sweep_configs(
+    overrides=["training.lr=0.001,0.01,0.1", "model.layers=50,101"],
+    config_dir="path/to/config",
+    config_name="config"
+)
+
+# Iterate over all run configurations
+for run in runs.runs:
+    print(f"Running with: {run.override_dict}")
+    # Access the fully resolved config
+    config = run.config
+    # Your training code here
+    # train_model(config)
+
+# Inspect the sweep parameters
+print(f"Total runs: {len(runs.runs)}")  # 6 runs (3 lr × 2 layers)
+print(f"Sweep parameters: {runs.override_map}")
 ```
 
 ## Development
