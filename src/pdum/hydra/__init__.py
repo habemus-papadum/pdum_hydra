@@ -353,6 +353,6 @@ def generate_sweep_configs(*,
         return _generate_sweep_configs(ctx, base_cfg, sweep_location)
 
 
-__version__ = "0.3.0-alpha"
+__version__ = "0.3.0"
 
 __all__ = ["__version__", "generate_sweep_configs", "RunConfig", "GeneratedRuns"]
