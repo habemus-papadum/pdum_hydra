@@ -2,10 +2,11 @@
 
 [Full report](https://htmlpreview.github.io/?https://github.com/habemus-papadum/pdum_hydra/blob/python-coverage-comment-action-data/htmlcov/index.html)
 
-| Name                           |    Stmts |     Miss |    Cover |   Missing |
-|------------------------------- | -------: | -------: | -------: | --------: |
-| src/pdum/hydra/\_\_init\_\_.py |        2 |        0 |     100% |           |
-|                      **TOTAL** |    **2** |    **0** | **100%** |           |
+| Name                           |    Stmts |     Miss |   Cover |   Missing |
+|------------------------------- | -------: | -------: | ------: | --------: |
+| src/pdum/hydra/\_\_init\_\_.py |      129 |       14 |     89% |79-81, 85, 116-117, 121-130, 184-185, 198, 204, 206 |
+| src/pdum/hydra/dynamic.py      |       13 |        0 |    100% |           |
+|                      **TOTAL** |  **142** |   **14** | **90%** |           |
 
 
 ## Setup coverage badge
