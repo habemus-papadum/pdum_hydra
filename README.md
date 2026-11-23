@@ -306,6 +306,7 @@ uv build
 - `./scripts/build.sh` – reproduce the release build locally
 - `./scripts/pre-release.sh` – run the full battery of quality checks
 - `./scripts/release.sh` – orchestrate the release (creates tags, publishes to PyPI/GitHub)
+- `./scripts/release.sh <level> --testing` – dry run: the checks and both version and lockfile updates, then the files are restored; nothing is committed, tagged, pushed or published
 - `./scripts/test_notebooks.sh` – execute demo notebooks (uses `./scripts/nb.sh` under the hood)
 
 ## License

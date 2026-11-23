@@ -36,6 +36,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/pdum"]
 
+# Resolve from PyPI first. A developer's own uv configuration can add a private index, and uv
+# asks user-level indexes before the default one, for every package of this public project.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
 [dependency-groups]
 dev = [
     "hatch>=1.14.2",
