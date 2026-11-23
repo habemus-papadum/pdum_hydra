@@ -4,11 +4,21 @@ Hydra utils for structured configuration and sweep generation.
 This module provides utilities for managing Hydra configurations with first-class
 support for parameter sweeps, building on top of the Hydra framework while
 simplifying sweep generation and configuration management.
+
+A sweep is a grid: it has **axes** (each swept parameter and its values) and **runs**
+(one per point on the grid). A run has **params** (its settings as a dict), **hydra_overrides**
+(the same settings as Hydra override strings) and **config** (the fully composed config).
+
+Runs are produced lazily and a run's config is composed only when first accessed, so
+large sweeps can be filtered cheaply on ``run.params`` before any config is built.
 """
+
 import itertools
+import math
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import List
+from collections.abc import Callable, Iterator, Sequence
+from functools import cached_property, partial
+from typing import Any, List, overload
 
 from hydra import initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
@@ -31,45 +41,142 @@ Pre-requisites:  Read hydra manual and codebase, grok the concepts of `overrides
 
 """
 
+# One choice along one dimension of the sweep: (hydra override string, params key, typed value).
+_Choice = tuple[str, str, Any]
 
-@dataclass
-class RunConfig:
+
+class Run:
     """
-    Configuration for a single run in a sweep.
+    A single run in a sweep: one point on the sweep's grid.
+
+    Runs are created by a :class:`Sweep`; you normally don't construct them yourself.
 
     Attributes
     ----------
-    overrides : List[str]
-        List of override strings applied to this run (e.g., ["lr=0.01", "batch_size=32"]).
-    override_dict : dict
-        Dictionary representation of the overrides with parsed values.
+    index : int
+        Position of this run in its sweep (``sweep[run.index]`` is an equivalent run).
+    params : dict[str, Any]
+        This run's settings as ``{key: value}``, with values typed by Hydra's parser
+        (e.g. ``{"training.lr": 0.01, "model.layers": 50}``). Includes both swept
+        parameters and fixed ones applied to every run. Cheap: use it to filter runs
+        before touching :attr:`config`.
+    hydra_overrides : list[str]
+        The same settings as Hydra override strings
+        (e.g. ``["training.lr=0.01", "model.layers=50"]``), suitable for passing back to
+        Hydra's command line or ``compose``.
     config : DictConfig
-        Fully rendered OmegaConf DictConfig with all overrides applied.
+        The fully composed config with this run's overrides applied. Composed on first
+        access and cached on this ``Run`` object.
+
+    Notes
+    -----
+    Pickling a ``Run`` (e.g. to send it to a worker process) composes its config first,
+    so the unpickled copy carries the config with it.
     """
-    overrides: List[str]
-    override_dict: dict
-    config: DictConfig
+
+    def __init__(
+        self,
+        index: int,
+        params: dict[str, Any],
+        hydra_overrides: list[str],
+        compose: Callable[[], DictConfig] | None,
+    ):
+        self.index = index
+        self.params = params
+        self.hydra_overrides = hydra_overrides
+        self._compose = compose
+
+    @cached_property
+    def config(self) -> DictConfig:
+        if self._compose is None:
+            raise RuntimeError("This Run has no way to compose its config.")
+        return self._compose()
+
+    def __getstate__(self) -> dict:
+        self.config  # compose (and cache) before shipping; the composer itself isn't picklable
+        state = self.__dict__.copy()
+        state["_compose"] = None
+        return state
+
+    def __repr__(self) -> str:
+        return f"Run(index={self.index}, params={self.params!r})"
 
 
-@dataclass
-class GeneratedRuns:
+class Sweep(Sequence[Run]):
     """
-    Collection of all runs generated from a sweep configuration.
+    A parameter sweep: the cartesian product of all swept parameters.
+
+    A ``Sweep`` is a lazy, re-iterable sequence of :class:`Run` objects. Nothing is
+    composed up front: ``len(sweep)`` and ``sweep[i]`` are computed directly from the
+    axes, and each run's config is composed only when ``run.config`` is first read.
+
+    Each access (iteration or indexing) creates a fresh ``Run``. A run caches its own
+    config, so keep a reference to the run if you need its config more than once.
 
     Attributes
     ----------
     base_config : DictConfig
-        The base Hydra configuration before sweep expansion.
-    override_map : dict[str, list]
-        Mapping of parameter names to their sweep values. For example,
-        {"lr": [0.001, 0.01, 0.1], "batch_size": [16, 32]}.
-    runs : List[RunConfig]
-        List of all individual run configurations generated from the sweep,
-        representing the cartesian product of all sweep parameters.
+        The composed configuration before sweep expansion (includes the ``hydra`` node).
+    axes : dict[str, list]
+        The swept parameters and their values, in sweep order, e.g.
+        ``{"training.lr": [0.001, 0.01, 0.1], "model.layers": [50, 101]}``. Fixed
+        (non-swept) settings don't appear here, but do appear in each run's ``params``.
+    runs : Sweep
+        This sweep. Provided so ``for run in sweep.runs`` reads naturally;
+        ``for run in sweep`` is equivalent.
     """
-    base_config: DictConfig
-    override_map: dict[str, list]
-    runs: List[RunConfig]
+
+    def __init__(
+        self,
+        base_config: DictConfig,
+        axes: dict[str, list],
+        dimensions: list[list[_Choice]],
+        compose: Callable[[list[str]], DictConfig],
+    ):
+        self.base_config = base_config
+        self.axes = axes
+        self._dimensions = dimensions
+        self._compose = compose
+        self._len = math.prod(len(d) for d in dimensions)
+
+    @property
+    def runs(self) -> "Sweep":
+        return self
+
+    def __len__(self) -> int:
+        return self._len
+
+    @overload
+    def __getitem__(self, index: int) -> Run: ...
+    @overload
+    def __getitem__(self, index: slice) -> list[Run]: ...
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self._len))]
+        if index < 0:
+            index += self._len
+        if not 0 <= index < self._len:
+            raise IndexError(f"Run index out of range (sweep has {self._len} runs)")
+        # Mixed-radix decomposition, matching itertools.product order (last dimension varies fastest).
+        choices = []
+        rest = index
+        for dim in reversed(self._dimensions):
+            rest, i = divmod(rest, len(dim))
+            choices.append(dim[i])
+        choices.reverse()
+        return self._make_run(index, choices)
+
+    def __iter__(self) -> Iterator[Run]:
+        for index, choices in enumerate(itertools.product(*self._dimensions)):
+            yield self._make_run(index, choices)
+
+    def _make_run(self, index: int, choices: Sequence[_Choice]) -> Run:
+        hydra_overrides = [override for override, _, _ in choices]
+        params = {key: value for _, key, value in choices}
+        return Run(index, params, hydra_overrides, partial(self._compose, hydra_overrides))
+
+    def __repr__(self) -> str:
+        return f"Sweep(len={self._len}, axes={self.axes!r})"
 
 
 def sweep_dict_to_overrides(sweep_dict):
@@ -165,95 +272,63 @@ def extract_sweep_overrides(ctx: HydraContext, cfg: DictConfig, sweep_location="
     return ovs
 
 
-def generate_sweep_overrides(ctx: HydraContext, cfg: DictConfig, sweep_location="sweeps"):
+def build_sweep_dimensions(
+    ctx: HydraContext, cfg: DictConfig, sweep_location="sweeps"
+) -> tuple[list[list[_Choice]], dict[str, list]]:
+    """
+    Turn a composed config's overrides into the dimensions of a sweep.
+
+    Returns
+    -------
+    dimensions : list[list[tuple[str, str, Any]]]
+        One list per override key. Each entry is ``(hydra_override, params_key, value)``.
+        Swept keys have one entry per value; fixed keys have a single entry.
+    axes : dict[str, list]
+        ``{params_key: values}`` for the swept keys only.
+    """
     ovs = extract_sweep_overrides(ctx, cfg, sweep_location)
     parser = OverridesParser.create(config_loader=ctx.config_loader)
-    choices = []
-    final_overrides = OrderedDict()
-    override_map = {}
+    dimensions: OrderedDict[str, list[_Choice]] = OrderedDict()
+    axes = {}
 
     for ov_line in ovs:
         ov = parser.parse_override(ov_line)
+        hydra_key = ov.get_key_element()  # keeps Hydra's +/++/~ prefix
+        key = hydra_key.lstrip("+")  # "+foo" / "++foo" just set foo
         if ov.is_sweep_override():
-            if ov.is_discrete_sweep():
-                key = ov.get_key_element()
-                sweep = [f"{key}={val}" for val in ov.sweep_string_iterator()]
-                final_overrides[key] = sweep
-                override_map[key] = list(ov.sweep_iterator())
-            else:
+            if not ov.is_discrete_sweep():
                 assert ov.value_type is not None
                 raise HydraException(f"Sweep type : {ov.value_type.name} is not supported.  Line: {ov_line}")
+            values = list(ov.sweep_iterator())
+            strings = list(ov.sweep_string_iterator())
+            dimensions[key] = [(f"{hydra_key}={s}", key, v) for s, v in zip(strings, values, strict=True)]
+            axes[key] = values
         else:
-            final_overrides[ov.key_or_group] = [ov_line]
+            dimensions[key] = [(ov_line, key, ov.value())]
 
-    for _, val in final_overrides.items():
-        choices.append(val)
-
-    return [list(x) for x in itertools.product(*choices)], override_map
+    return list(dimensions.values()), axes
 
 
-def simple_overrides_to_dict(ctx: HydraContext, overrides: List[str]) -> dict:
-    def convert_string(s):
-        if not isinstance(s, str):
-            return s
-
-        _s = s.strip().lower()
-
-        # Try boolean
-        if _s == "true":
-            return True
-        if _s in "false":
-            return False
-
-        # Try int
-        try:
-            return int(s)
-        except ValueError:
-            pass
-
-        # Try float
-        try:
-            return float(s)
-        except ValueError:
-            pass
-
-        # Return original if no conversion possible
-        return s
-
-    parser = OverridesParser.create(config_loader=ctx.config_loader)
-    ovs = parser.parse_overrides(overrides)
-    d = {}
-    for ov in ovs:
-        d[ov.get_key_element()] = convert_string(ov.get_value_element_as_str())
-    return d
+def _build_sweep(ctx: HydraContext, cfg: DictConfig, sweep_location="sweeps") -> Sweep:
+    dimensions, axes = build_sweep_dimensions(ctx, cfg, sweep_location)
+    return Sweep(cfg, axes, dimensions, partial(render_sweep_config, ctx, cfg))
 
 
-def _generate_sweep_configs(ctx: HydraContext, cfg: DictConfig, sweep_location="sweeps") -> GeneratedRuns:
-    overrides, final_overrides = generate_sweep_overrides(ctx, cfg, sweep_location)
-
-    runs = [
-        RunConfig(
-            override,
-            simple_overrides_to_dict(ctx, override),
-            render_sweep_config(ctx, cfg, override),
-        )
-        for override in overrides
-    ]
-    return GeneratedRuns(cfg, final_overrides, runs)
-
-
-def generate_sweep_configs(*,
+def generate_sweep_configs(
+    *,
     overrides=None,
     config_name="config",
     config_dir="config",
     sweep_location=DEFAULT_SWEEP_LOCATION,
-) -> GeneratedRuns:
+) -> Sweep:
     """
-    Generate all configurations for a parameter sweep.
+    Generate a lazy parameter sweep from a Hydra configuration.
 
-    This function loads a Hydra configuration and generates all possible
-    run configurations based on sweep parameters defined either in command-line
-    overrides or in sweep configuration files.
+    Loads a Hydra configuration and returns a :class:`Sweep` covering every
+    combination of the sweep parameters, defined either in overrides or in sweep
+    configuration files. Runs are produced lazily and each run's config is composed
+    only when ``run.config`` is first accessed, so you can skip runs based on
+    ``run.params`` without paying for config composition.
 
     Parameters
     ----------
@@ -270,9 +345,14 @@ def generate_sweep_configs(*,
 
     Returns
     -------
-    GeneratedRuns
-        Object containing the base configuration, override mappings, and all
-        generated run configurations.
+    Sweep
+        A lazy sequence of :class:`Run` objects, with the sweep's ``axes`` and
+        ``base_config``.
+
+    Raises
+    ------
+    HydraException
+        If an override uses a non-discrete sweep (e.g. ``range`` or ``interval``).
 
     Notes
     -----
@@ -304,14 +384,22 @@ def generate_sweep_configs(*,
     Examples
     --------
     >>> # Generate sweep from command-line overrides
-    >>> runs = generate_sweep_configs(
+    >>> sweep = generate_sweep_configs(
     ...     overrides=["lr=0.001,0.01", "batch_size=16,32"],
     ...     config_dir="/path/to/config"
     ... )
-    >>> print(len(runs.runs))  # Number of runs in sweep
+    >>> len(sweep)  # computed without composing any config
     4
-    >>> print(runs.override_map)
+    >>> sweep.axes
     {'lr': [0.001, 0.01], 'batch_size': [16, 32]}
+
+    >>> # Filter cheaply on params, then (if needed) on the full config
+    >>> for run in sweep:
+    ...     if run.params["lr"] == 0.01 and run.params["batch_size"] == 32:
+    ...         continue  # skipped: no config composed
+    ...     if not looks_useful(run.config):  # composed here, cached on run
+    ...         continue
+    ...     train_model(run.config)
 
     >>> # Use a sweep file: config/sweeps/my_sweep.yaml
     >>> # File contents:
@@ -321,26 +409,19 @@ def generate_sweep_configs(*,
     >>> #   lr: [0.001, 0.01]
     >>> #   batch_size: 32  # scalar, no sweep
     >>>
-    >>> runs = generate_sweep_configs(
+    >>> sweep = generate_sweep_configs(
     ...     overrides=["+sweeps=my_sweep"],
     ...     config_dir="/path/to/config"
     ... )
-    >>> print(len(runs.runs))  # 5 trials × 3 models × 2 lrs = 30
+    >>> len(sweep)  # 5 trials × 3 models × 2 lrs = 30
     30
 
-    >>> # Access individual run configurations
-    >>> for run in runs.runs:
-    ...     print(run.override_dict)
-    ...     # All runs have batch_size=32 (scalar value)
-    ...     # Use run.config to access the full OmegaConf DictConfig
-    ...     train_model(run.config)
-
     >>> # Combine sweep file with additional overrides
-    >>> runs = generate_sweep_configs(
+    >>> sweep = generate_sweep_configs(
     ...     overrides=["+sweeps=my_sweep", "optimizer=adam,sgd"],
     ...     config_dir="/path/to/config"
     ... )
-    >>> print(len(runs.runs))  # 30 × 2 optimizers = 60
+    >>> len(sweep)  # 30 × 2 optimizers = 60
     60
     """
     if overrides is None:
@@ -350,9 +431,12 @@ def generate_sweep_configs(*,
         cb = Callback()
         ctx = HydraContext(gh.config_loader(), cb)
         base_cfg = gh.hydra.compose_config(config_name=config_name, overrides=overrides, run_mode=RunMode.MULTIRUN)
-        return _generate_sweep_configs(ctx, base_cfg, sweep_location)
+        # Runs compose their configs lazily, after this `with` block has exited. That works because
+        # the config loader captured in `ctx` keeps its own config repository and doesn't need
+        # Hydra's global state.
+        return _build_sweep(ctx, base_cfg, sweep_location)
 
 
 __version__ = "0.4.0-alpha"
 
-__all__ = ["__version__", "generate_sweep_configs", "RunConfig", "GeneratedRuns"]
+__all__ = ["__version__", "generate_sweep_configs", "Run", "Sweep"]

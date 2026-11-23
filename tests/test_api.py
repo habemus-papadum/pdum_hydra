@@ -1,13 +1,17 @@
 """Unit tests for the pdum.hydra public API."""
 
 import os
+import pickle
 import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+from hydra.core.global_hydra import GlobalHydra
+from hydra.errors import HydraException
 from omegaconf import DictConfig, OmegaConf
 
-from pdum.hydra import GeneratedRuns, RunConfig, generate_sweep_configs
+import pdum.hydra as pdum_hydra
+from pdum.hydra import Run, Sweep, generate_sweep_configs
 
 
 @pytest.fixture
@@ -159,98 +163,191 @@ parameters:
     return config_dir
 
 
-class TestRunConfig:
-    """Test suite for RunConfig dataclass."""
-
-    def test_run_config_creation(self):
-        """Test that RunConfig can be instantiated with all required fields."""
-        overrides = ["lr=0.01", "batch_size=32"]
-        override_dict = {"lr": 0.01, "batch_size": 32}
-        config = OmegaConf.create({"lr": 0.01, "batch_size": 32})
-
-        run_config = RunConfig(
-            overrides=overrides,
-            override_dict=override_dict,
-            config=config
-        )
-
-        assert run_config.overrides == overrides
-        assert run_config.override_dict == override_dict
-        assert isinstance(run_config.config, DictConfig)
-        assert run_config.config.lr == 0.01
-
-    def test_run_config_attributes(self):
-        """Test that RunConfig attributes are accessible."""
-        config = OmegaConf.create({"model": "resnet", "layers": 50})
-        run_config = RunConfig(
-            overrides=["model=resnet"],
-            override_dict={"model": "resnet"},
-            config=config
-        )
-
-        assert hasattr(run_config, "overrides")
-        assert hasattr(run_config, "override_dict")
-        assert hasattr(run_config, "config")
-
-    def test_run_config_empty_overrides(self):
-        """Test RunConfig with empty overrides."""
-        run_config = RunConfig(
-            overrides=[],
-            override_dict={},
-            config=OmegaConf.create({})
-        )
-
-        assert run_config.overrides == []
-        assert run_config.override_dict == {}
-        assert isinstance(run_config.config, DictConfig)
+def _counting_compose():
+    """Patch the config composer so tests can count how many configs get built."""
+    return patch("pdum.hydra.render_sweep_config", wraps=pdum_hydra.render_sweep_config)
 
 
-class TestGeneratedRuns:
-    """Test suite for GeneratedRuns dataclass."""
+class TestRun:
+    """Test suite for the Run class."""
 
-    def test_generated_runs_creation(self):
-        """Test that GeneratedRuns can be instantiated."""
-        base_config = OmegaConf.create({"default": "value"})
-        override_map = {"lr": [0.001, 0.01], "batch_size": [16, 32]}
-        runs = [
-            RunConfig(
-                overrides=["lr=0.001", "batch_size=16"],
-                override_dict={"lr": 0.001, "batch_size": 16},
-                config=OmegaConf.create({"lr": 0.001, "batch_size": 16})
+    def test_run_fields(self):
+        """A Run exposes index, params, hydra_overrides and a lazily composed config."""
+        compose = MagicMock(return_value=OmegaConf.create({"lr": 0.01}))
+        run = Run(3, {"lr": 0.01}, ["lr=0.01"], compose)
+
+        assert run.index == 3
+        assert run.params == {"lr": 0.01}
+        assert run.hydra_overrides == ["lr=0.01"]
+        compose.assert_not_called()
+
+        assert run.config.lr == 0.01
+        assert run.config.lr == 0.01
+        compose.assert_called_once()
+
+    def test_run_without_composer(self):
+        """A Run with no composer raises when its config is accessed."""
+        run = Run(0, {}, [], None)
+        with pytest.raises(RuntimeError):
+            run.config
+
+    def test_run_repr_does_not_compose(self):
+        """repr shows index and params without composing the config."""
+        compose = MagicMock()
+        run = Run(0, {"lr": 0.01}, ["lr=0.01"], compose)
+        assert repr(run) == "Run(index=0, params={'lr': 0.01})"
+        compose.assert_not_called()
+
+
+class TestSweep:
+    """Test suite for the lazy Sweep sequence."""
+
+    def test_len_and_axes_without_composing(self, simple_config_dir):
+        """len() and axes are available without composing any config."""
+        with _counting_compose() as compose:
+            sweep = generate_sweep_configs(
+                overrides=["training.lr=0.001,0.01,0.1", "model.layers=50,101"],
+                config_dir=simple_config_dir,
             )
-        ]
+            assert len(sweep) == 6
+            assert len(sweep.runs) == 6
+            assert sweep.axes == {"training.lr": [0.001, 0.01, 0.1], "model.layers": [50, 101]}
+            runs = list(sweep)
+            assert len(runs) == 6
+            assert compose.call_count == 0
 
-        generated_runs = GeneratedRuns(
-            base_config=base_config,
-            override_map=override_map,
-            runs=runs
-        )
+    def test_config_composed_lazily_and_cached(self, simple_config_dir):
+        """Each run's config is composed on first access only."""
+        with _counting_compose() as compose:
+            sweep = generate_sweep_configs(overrides=["training.lr=0.001,0.01"], config_dir=simple_config_dir)
+            run = sweep[1]
+            assert compose.call_count == 0
+            assert run.config.training.lr == 0.01
+            assert run.config.training.lr == 0.01
+            assert compose.call_count == 1
 
-        assert isinstance(generated_runs.base_config, DictConfig)
-        assert generated_runs.override_map == override_map
-        assert len(generated_runs.runs) == 1
-
-    def test_generated_runs_multiple_runs(self):
-        """Test GeneratedRuns with multiple run configurations."""
-        base_config = OmegaConf.create({})
-        override_map = {"param": [1, 2, 3]}
-        runs = [
-            RunConfig(
-                overrides=[f"param={i}"],
-                override_dict={"param": i},
-                config=OmegaConf.create({"param": i})
+    def test_filtering_on_params_skips_composition(self, simple_config_dir):
+        """Runs filtered out on params never have their config composed."""
+        with _counting_compose() as compose:
+            sweep = generate_sweep_configs(
+                overrides=["training.lr=0.001,0.01,0.1", "model.layers=50,101"],
+                config_dir=simple_config_dir,
             )
-            for i in [1, 2, 3]
-        ]
+            kept = []
+            for run in sweep:
+                if run.params["model.layers"] == 101 and run.params["training.lr"] == 0.1:
+                    continue
+                if run.config.training.lr == 0.001:
+                    continue
+                kept.append(run)
+            assert [(r.params["training.lr"], r.params["model.layers"]) for r in kept] == [
+                (0.01, 50),
+                (0.01, 101),
+                (0.1, 50),
+            ]
+            assert compose.call_count == 5
 
-        generated_runs = GeneratedRuns(
-            base_config=base_config,
-            override_map=override_map,
-            runs=runs
+    def test_reiterable(self, simple_config_dir):
+        """A sweep can be iterated more than once."""
+        sweep = generate_sweep_configs(overrides=["training.lr=0.001,0.01"], config_dir=simple_config_dir)
+        assert [r.params for r in sweep] == [r.params for r in sweep]
+
+    def test_indexing_matches_iteration(self, simple_config_dir):
+        """sweep[i] gives the same run as the i-th item of iteration."""
+        sweep = generate_sweep_configs(
+            overrides=["training.lr=0.001,0.01,0.1", "model.layers=50,101", "model.name=a,b"],
+            config_dir=simple_config_dir,
         )
+        iterated = list(sweep)
+        assert [r.index for r in iterated] == list(range(12))
+        for i, run in enumerate(iterated):
+            assert sweep[i].params == run.params
+            assert sweep[i].hydra_overrides == run.hydra_overrides
+            assert sweep[i].index == i
+        # last dimension varies fastest, like itertools.product
+        assert iterated[0].params == {"training.lr": 0.001, "model.layers": 50, "model.name": "a"}
+        assert iterated[1].params == {"training.lr": 0.001, "model.layers": 50, "model.name": "b"}
 
-        assert len(generated_runs.runs) == 3
-        assert all(isinstance(run, RunConfig) for run in generated_runs.runs)
+    def test_negative_index_and_slice(self, simple_config_dir):
+        """Negative indices and slices work like a list."""
+        sweep = generate_sweep_configs(overrides=["training.lr=0.001,0.01,0.1"], config_dir=simple_config_dir)
+        assert sweep[-1].params == {"training.lr": 0.1}
+        assert sweep[-1].index == 2
+        assert [r.params["training.lr"] for r in sweep[::2]] == [0.001, 0.1]
+        with pytest.raises(IndexError):
+            sweep[3]
+        with pytest.raises(IndexError):
+            sweep[-4]
+
+    def test_config_after_hydra_context_exits(self, simple_config_dir):
+        """Configs compose correctly after generate_sweep_configs has returned."""
+        sweep = generate_sweep_configs(overrides=["training.lr=0.001,0.01"], config_dir=simple_config_dir)
+        assert not GlobalHydra.instance().is_initialized()
+        assert sweep[0].config.training.lr == 0.001
+        assert sweep[0].config.model.name == "resnet"
+        assert "hydra" not in sweep[0].config
+
+    def test_pickle_run(self, simple_config_dir):
+        """A pickled run carries its composed config."""
+        sweep = generate_sweep_configs(overrides=["training.lr=0.001,0.01"], config_dir=simple_config_dir)
+        run = pickle.loads(pickle.dumps(sweep[1]))
+        assert run.index == 1
+        assert run.params == {"training.lr": 0.01}
+        assert run.hydra_overrides == ["training.lr=0.01"]
+        assert run.config.training.lr == 0.01
+
+    def test_repr(self, simple_config_dir):
+        sweep = generate_sweep_configs(overrides=["training.lr=0.001,0.01"], config_dir=simple_config_dir)
+        assert repr(sweep) == "Sweep(len=2, axes={'training.lr': [0.001, 0.01]})"
+
+
+class TestParams:
+    """run.params values are typed by Hydra's parser."""
+
+    def test_typed_values(self, simple_config_dir):
+        """Bools, null, ints, floats and strings come through with the right types."""
+        sweep = generate_sweep_configs(
+            overrides=["+flag=true,false", "+nothing=null", "model.layers=50", "model.name=f", "training.lr=1e-3"],
+            config_dir=simple_config_dir,
+        )
+        assert [r.params["flag"] for r in sweep] == [True, False]
+        params = sweep[0].params
+        assert params["nothing"] is None
+        assert params["model.layers"] == 50
+        assert params["training.lr"] == 0.001
+        # Regression: strings that are substrings of "false" used to become False.
+        assert params["model.name"] == "f"
+        for value in ["a", "al", "fa"]:
+            s = generate_sweep_configs(overrides=[f"model.name={value}"], config_dir=simple_config_dir)
+            assert s[0].params["model.name"] == value
+
+    def test_plus_prefix_stripped_from_keys(self, simple_config_dir):
+        """'+key' overrides appear as 'key' in params and axes, but keep '+' in hydra_overrides."""
+        sweep = generate_sweep_configs(overrides=["+extra=1,2", "++other=3"], config_dir=simple_config_dir)
+        assert sweep.axes == {"extra": [1, 2]}
+        assert sweep[0].params == {"extra": 1, "other": 3}
+        assert sweep[0].hydra_overrides == ["+extra=1", "++other=3"]
+        assert sweep[0].config.extra == 1
+        assert sweep[0].config.other == 3
+
+    def test_params_include_fixed_settings(self, simple_config_dir):
+        """Fixed overrides are in params but not in axes."""
+        sweep = generate_sweep_configs(
+            overrides=["training.lr=0.001,0.01", "training.epochs=5"], config_dir=simple_config_dir
+        )
+        assert sweep.axes == {"training.lr": [0.001, 0.01]}
+        assert sweep[0].params == {"training.lr": 0.001, "training.epochs": 5}
+
+    def test_range_sweep(self, simple_config_dir):
+        """range() is a discrete sweep and is supported."""
+        sweep = generate_sweep_configs(overrides=["training.epochs=range(1,4)"], config_dir=simple_config_dir)
+        assert sweep.axes == {"training.epochs": [1, 2, 3]}
+        assert [r.config.training.epochs for r in sweep] == [1, 2, 3]
+
+    def test_unsupported_sweep_type(self, simple_config_dir):
+        """Non-discrete sweeps such as interval() are rejected."""
+        with pytest.raises(HydraException):
+            generate_sweep_configs(overrides=["training.lr=interval(0.1,1.0)"], config_dir=simple_config_dir)
 
 
 class TestGenerateSweepConfigs:
@@ -258,27 +355,22 @@ class TestGenerateSweepConfigs:
 
     def test_generate_sweep_configs_basic(self, simple_config_dir):
         """Test basic sweep config generation without any sweeps."""
-        result = generate_sweep_configs(
-            config_dir=simple_config_dir,
-            config_name="config"
-        )
+        result = generate_sweep_configs(config_dir=simple_config_dir, config_name="config")
 
-        assert isinstance(result, GeneratedRuns)
+        assert isinstance(result, Sweep)
         assert isinstance(result.base_config, DictConfig)
-        assert isinstance(result.runs, list)
+        assert isinstance(result.runs, Sweep)
         # Without sweeps, should have exactly 1 run
         assert len(result.runs) == 1
-        assert isinstance(result.runs[0], RunConfig)
+        assert isinstance(result.runs[0], Run)
 
     def test_generate_sweep_configs_with_single_override(self, simple_config_dir):
         """Test sweep config generation with a single override value."""
         result = generate_sweep_configs(
-            overrides=["training.lr=0.001"],
-            config_dir=simple_config_dir,
-            config_name="config"
+            overrides=["training.lr=0.001"], config_dir=simple_config_dir, config_name="config"
         )
 
-        assert isinstance(result, GeneratedRuns)
+        assert isinstance(result, Sweep)
         assert len(result.runs) == 1
         # Check that the override was applied
         assert result.runs[0].config.training.lr == 0.001
@@ -286,18 +378,16 @@ class TestGenerateSweepConfigs:
     def test_generate_sweep_configs_with_sweep(self, simple_config_dir):
         """Test sweep config generation with sweep parameters."""
         result = generate_sweep_configs(
-            overrides=["training.lr=0.001,0.01,0.1"],
-            config_dir=simple_config_dir,
-            config_name="config"
+            overrides=["training.lr=0.001,0.01,0.1"], config_dir=simple_config_dir, config_name="config"
         )
 
-        assert isinstance(result, GeneratedRuns)
+        assert isinstance(result, Sweep)
         # Should have 3 runs for 3 learning rates
         assert len(result.runs) == 3
 
         # Check override map
-        assert "training.lr" in result.override_map
-        assert result.override_map["training.lr"] == [0.001, 0.01, 0.1]
+        assert "training.lr" in result.axes
+        assert result.axes["training.lr"] == [0.001, 0.01, 0.1]
 
         # Check that each run has the correct lr
         lrs = [run.config.training.lr for run in result.runs]
@@ -308,40 +398,32 @@ class TestGenerateSweepConfigs:
         result = generate_sweep_configs(
             overrides=["training.lr=0.001,0.01", "training.batch_size=16,32"],
             config_dir=simple_config_dir,
-            config_name="config"
+            config_name="config",
         )
 
         # 2 learning rates × 2 batch sizes = 4 runs
         assert len(result.runs) == 4
 
         # Check that we have all combinations
-        configs = [(run.config.training.lr, run.config.training.batch_size)
-                   for run in result.runs]
-        expected = [
-            (0.001, 16), (0.001, 32),
-            (0.01, 16), (0.01, 32)
-        ]
+        configs = [(run.config.training.lr, run.config.training.batch_size) for run in result.runs]
+        expected = [(0.001, 16), (0.001, 32), (0.01, 16), (0.01, 32)]
         assert set(configs) == set(expected)
 
-    def test_generate_sweep_configs_override_dict(self, simple_config_dir):
-        """Test that override_dict is correctly populated."""
+    def test_generate_sweep_configs_params(self, simple_config_dir):
+        """Test that params is correctly populated."""
         result = generate_sweep_configs(
-            overrides=["training.lr=0.001,0.01"],
-            config_dir=simple_config_dir,
-            config_name="config"
+            overrides=["training.lr=0.001,0.01"], config_dir=simple_config_dir, config_name="config"
         )
 
         assert len(result.runs) == 2
         for run in result.runs:
-            assert "training.lr" in run.override_dict
-            assert run.override_dict["training.lr"] in [0.001, 0.01]
+            assert "training.lr" in run.params
+            assert run.params["training.lr"] in [0.001, 0.01]
 
     def test_generate_sweep_configs_with_string_sweep(self, simple_config_dir):
         """Test sweep with string values."""
         result = generate_sweep_configs(
-            overrides=["model.name=resnet,vgg,alexnet"],
-            config_dir=simple_config_dir,
-            config_name="config"
+            overrides=["model.name=resnet,vgg,alexnet"], config_dir=simple_config_dir, config_name="config"
         )
 
         assert len(result.runs) == 3
@@ -351,13 +433,9 @@ class TestGenerateSweepConfigs:
     def test_generate_sweep_configs_mixed_types(self, simple_config_dir):
         """Test sweep with mixed parameter types."""
         result = generate_sweep_configs(
-            overrides=[
-                "model.name=resnet,vgg",
-                "training.lr=0.001,0.01",
-                "training.epochs=50,100"
-            ],
+            overrides=["model.name=resnet,vgg", "training.lr=0.001,0.01", "training.epochs=50,100"],
             config_dir=simple_config_dir,
-            config_name="config"
+            config_name="config",
         )
 
         # 2 × 2 × 2 = 8 runs
@@ -371,13 +449,9 @@ class TestGenerateSweepConfigs:
 
     def test_generate_sweep_configs_with_sweep_location(self, sweep_config_dir):
         """Test using sweep configurations from files."""
-        result = generate_sweep_configs(
-            overrides=["+sweeps=basic"],
-            config_dir=sweep_config_dir,
-            config_name="config"
-        )
+        result = generate_sweep_configs(overrides=["+sweeps=basic"], config_dir=sweep_config_dir, config_name="config")
 
-        assert isinstance(result, GeneratedRuns)
+        assert isinstance(result, Sweep)
         assert len(result.runs) >= 1
         # Verify the sweep config was loaded and applied
         # The basic.yaml sets lr=0.001 and batch_size=64
@@ -386,45 +460,36 @@ class TestGenerateSweepConfigs:
 
     def test_generate_sweep_configs_empty_overrides(self, simple_config_dir):
         """Test with explicitly empty overrides list."""
-        result = generate_sweep_configs(
-            overrides=[],
-            config_dir=simple_config_dir,
-            config_name="config"
-        )
+        result = generate_sweep_configs(overrides=[], config_dir=simple_config_dir, config_name="config")
 
-        assert isinstance(result, GeneratedRuns)
+        assert isinstance(result, Sweep)
         assert len(result.runs) == 1
 
     def test_generate_sweep_configs_none_overrides(self, simple_config_dir):
         """Test with None overrides (default parameter)."""
-        result = generate_sweep_configs(
-            config_dir=simple_config_dir,
-            config_name="config"
-        )
+        result = generate_sweep_configs(config_dir=simple_config_dir, config_name="config")
 
-        assert isinstance(result, GeneratedRuns)
+        assert isinstance(result, Sweep)
         assert len(result.runs) == 1
 
     def test_sweep_file_with_arrays(self, advanced_sweep_config_dir):
         """Test sweep file with array parameters creating sweep dimensions."""
         result = generate_sweep_configs(
-            overrides=["+sweeps=mixed"],
-            config_dir=advanced_sweep_config_dir,
-            config_name="config"
+            overrides=["+sweeps=mixed"], config_dir=advanced_sweep_config_dir, config_name="config"
         )
 
         # 3 lr × 3 batch_size × 2 model.name = 18 runs
         assert len(result.runs) == 18
 
-        # Check that sweep dimensions are in override_map
-        assert "training.lr" in result.override_map
-        assert "training.batch_size" in result.override_map
-        assert "model.name" in result.override_map
+        # Check that sweep dimensions are in axes
+        assert "training.lr" in result.axes
+        assert "training.batch_size" in result.axes
+        assert "model.name" in result.axes
 
         # Verify the sweep values
-        assert set(result.override_map["training.lr"]) == {0.001, 0.01, 0.1}
-        assert set(result.override_map["training.batch_size"]) == {16, 32, 64}
-        assert set(result.override_map["model.name"]) == {"resnet", "vgg"}
+        assert set(result.axes["training.lr"]) == {0.001, 0.01, 0.1}
+        assert set(result.axes["training.batch_size"]) == {16, 32, 64}
+        assert set(result.axes["model.name"]) == {"resnet", "vgg"}
 
         # Verify all runs have the scalar value applied
         for run in result.runs:
@@ -433,27 +498,25 @@ class TestGenerateSweepConfigs:
     def test_sweep_file_with_scalars_and_arrays(self, advanced_sweep_config_dir):
         """Test sweep file with both scalar values and array sweep parameters."""
         result = generate_sweep_configs(
-            overrides=["+sweeps=comprehensive"],
-            config_dir=advanced_sweep_config_dir,
-            config_name="config"
+            overrides=["+sweeps=comprehensive"], config_dir=advanced_sweep_config_dir, config_name="config"
         )
 
         # 5 trials × 3 competitions × 3 models = 45 runs
         assert len(result.runs) == 45
 
         # Check sweep dimensions
-        assert "trial" in result.override_map
-        assert "competition" in result.override_map
-        assert "agent.code.model" in result.override_map
+        assert "trial" in result.axes
+        assert "competition" in result.axes
+        assert "agent.code.model" in result.axes
 
         # Verify sweep values
-        assert result.override_map["trial"] == [0, 1, 2, 3, 4]
-        assert set(result.override_map["competition"]) == {
+        assert result.axes["trial"] == [0, 1, 2, 3, 4]
+        assert set(result.axes["competition"]) == {
             "random-acts-of-pizza",
             "new-york-city-taxi-fare-prediction",
-            "tabular-playground-series-may-2022"
+            "tabular-playground-series-may-2022",
         }
-        assert set(result.override_map["agent.code.model"]) == {"o1", "o3-mini", "o1-mini"}
+        assert set(result.axes["agent.code.model"]) == {"o1", "o3-mini", "o1-mini"}
 
         # Verify scalar values are applied to all runs
         for run in result.runs:
@@ -468,19 +531,13 @@ class TestGenerateSweepConfigs:
     def test_sweep_file_cartesian_product(self, advanced_sweep_config_dir):
         """Test that sweep file arrays create cartesian product."""
         result = generate_sweep_configs(
-            overrides=["+sweeps=comprehensive"],
-            config_dir=advanced_sweep_config_dir,
-            config_name="config"
+            overrides=["+sweeps=comprehensive"], config_dir=advanced_sweep_config_dir, config_name="config"
         )
 
         # Verify we have all combinations
         combinations = set()
         for run in result.runs:
-            combo = (
-                run.config.trial,
-                run.config.competition,
-                run.config.agent.code.model
-            )
+            combo = (run.config.trial, run.config.competition, run.config.agent.code.model)
             combinations.add(combo)
 
         # Should have 5 × 3 × 3 = 45 unique combinations
@@ -490,26 +547,24 @@ class TestGenerateSweepConfigs:
         assert (0, "random-acts-of-pizza", "o1") in combinations
         assert (4, "tabular-playground-series-may-2022", "o1-mini") in combinations
 
-    def test_sweep_file_override_dict_with_arrays(self, advanced_sweep_config_dir):
-        """Test that override_dict is correctly populated for sweep files with arrays."""
+    def test_sweep_file_params_with_arrays(self, advanced_sweep_config_dir):
+        """Test that params is correctly populated for sweep files with arrays."""
         result = generate_sweep_configs(
-            overrides=["+sweeps=mixed"],
-            config_dir=advanced_sweep_config_dir,
-            config_name="config"
+            overrides=["+sweeps=mixed"], config_dir=advanced_sweep_config_dir, config_name="config"
         )
 
-        # Check each run has correct override_dict
+        # Check each run has correct params
         for run in result.runs:
-            assert "training.lr" in run.override_dict
-            assert "training.batch_size" in run.override_dict
-            assert "model.name" in run.override_dict
-            assert "training.optimizer" in run.override_dict
+            assert "training.lr" in run.params
+            assert "training.batch_size" in run.params
+            assert "model.name" in run.params
+            assert "training.optimizer" in run.params
 
             # Verify values are from the sweep
-            assert run.override_dict["training.lr"] in [0.001, 0.01, 0.1]
-            assert run.override_dict["training.batch_size"] in [16, 32, 64]
-            assert run.override_dict["model.name"] in ["resnet", "vgg"]
-            assert run.override_dict["training.optimizer"] == "adam"
+            assert run.params["training.lr"] in [0.001, 0.01, 0.1]
+            assert run.params["training.batch_size"] in [16, 32, 64]
+            assert run.params["model.name"] in ["resnet", "vgg"]
+            assert run.params["training.optimizer"] == "adam"
 
 
 class TestDynamicLoadConfig:
@@ -518,6 +573,7 @@ class TestDynamicLoadConfig:
     def test_load_config_import(self):
         """Test that load_config can be imported."""
         from pdum.hydra.dynamic import load_config
+
         assert callable(load_config)
 
     def test_load_config_no_env_var(self):
@@ -544,7 +600,7 @@ class TestDynamicLoadConfig:
         os.environ[env_var_name] = "production"
 
         try:
-            with patch('pdum.hydra.dynamic.importlib.import_module') as mock_import:
+            with patch("pdum.hydra.dynamic.importlib.import_module") as mock_import:
                 # Make import_module update sys.modules
                 def import_side_effect(name):
                     sys.modules[name] = mock_module
@@ -562,8 +618,8 @@ class TestDynamicLoadConfig:
             # Clean up
             if env_var_name in os.environ:
                 del os.environ[env_var_name]
-            if 'test.base.production' in sys.modules:
-                del sys.modules['test.base.production']
+            if "test.base.production" in sys.modules:
+                del sys.modules["test.base.production"]
 
 
 class TestAPIExports:
@@ -572,31 +628,36 @@ class TestAPIExports:
     def test_version_export(self):
         """Test that __version__ is exported."""
         from pdum import hydra
+
         assert hasattr(hydra, "__version__")
         assert isinstance(hydra.__version__, str)
 
     def test_generate_sweep_configs_export(self):
         """Test that generate_sweep_configs is exported."""
         from pdum import hydra
+
         assert hasattr(hydra, "generate_sweep_configs")
         assert callable(hydra.generate_sweep_configs)
 
-    def test_run_config_export(self):
-        """Test that RunConfig is exported."""
+    def test_run_export(self):
+        """Test that Run is exported."""
         from pdum import hydra
-        assert hasattr(hydra, "RunConfig")
 
-    def test_generated_runs_export(self):
-        """Test that GeneratedRuns is exported."""
+        assert hasattr(hydra, "Run")
+
+    def test_sweep_export(self):
+        """Test that Sweep is exported."""
         from pdum import hydra
-        assert hasattr(hydra, "GeneratedRuns")
+
+        assert hasattr(hydra, "Sweep")
 
     def test_all_exports(self):
         """Test that __all__ contains expected exports."""
         from pdum import hydra
+
         assert hasattr(hydra, "__all__")
 
-        expected_exports = {"__version__", "generate_sweep_configs", "RunConfig", "GeneratedRuns"}
+        expected_exports = {"__version__", "generate_sweep_configs", "Run", "Sweep"}
         actual_exports = set(hydra.__all__)
 
         assert expected_exports == actual_exports
@@ -604,9 +665,11 @@ class TestAPIExports:
     def test_dynamic_module_exists(self):
         """Test that dynamic module can be imported."""
         from pdum.hydra import dynamic
+
         assert dynamic is not None
 
     def test_dynamic_load_config_accessible(self):
         """Test that load_config is accessible from dynamic module."""
         from pdum.hydra.dynamic import load_config
+
         assert callable(load_config)

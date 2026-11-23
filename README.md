@@ -26,30 +26,66 @@ uv pip install habemus-papadum-hydra
 
 ## Usage
 
+### The mental model
+
+A **sweep** is a grid. It has **axes** (each swept parameter and its values) and **runs** (one per point on the grid).
+A **run** has three views of the same settings:
+
+| Field | What it is | Example |
+|---|---|---|
+| `run.params` | Settings as a dict, typed by Hydra. Cheap: use it to filter. | `{"training.lr": 0.01, "model.layers": 50}` |
+| `run.hydra_overrides` | The same settings as Hydra override strings | `["training.lr=0.01", "model.layers=50"]` |
+| `run.config` | The fully composed config. Built on first access, then cached on the run. | `DictConfig` |
+
+The sweep is lazy: `len(sweep)` and `sweep[i]` don't compose anything, and a run's config is only composed when you
+read `run.config`. So you can skip combinations you don't want before paying for them.
+
 ### Basic Parameter Sweeps
 
 ```python
 from pdum.hydra import generate_sweep_configs
 
-# Generate sweep from config directory with parameter sweeps
-runs = generate_sweep_configs(
+sweep = generate_sweep_configs(
     overrides=["training.lr=0.001,0.01,0.1", "model.layers=50,101"],
     config_dir="path/to/config",
-    config_name="config"
+    config_name="config",
 )
 
-# Iterate over all run configurations
-for run in runs.runs:
-    print(f"Running with: {run.override_dict}")
-    # Access the fully resolved config
-    config = run.config
-    # Your training code here
-    # train_model(config)
+print(len(sweep))   # 6 (3 lr × 2 layers), nothing composed yet
+print(sweep.axes)   # {'training.lr': [0.001, 0.01, 0.1], 'model.layers': [50, 101]}
 
-# Inspect the sweep parameters
-print(f"Total runs: {len(runs.runs)}")  # 6 runs (3 lr × 2 layers)
-print(f"Sweep parameters: {runs.override_map}")
+for run in sweep:
+    print(f"Run {run.index}: {run.params}")
+    train_model(run.config)
 ```
+
+### Filtering Runs
+
+Filter in two stages: first on `run.params` (no config is composed), then, for the runs that survive, on the full
+`run.config` if you need it.
+
+```python
+for run in sweep:
+    # Cheap: skip combinations that don't make sense, without composing a config
+    if run.params["model.layers"] == 101 and run.params["training.lr"] == 0.1:
+        continue
+
+    # Expensive: compose the config (cached on the run) and check something in it
+    if run.config.training.batch_size * run.config.model.layers > 10_000:
+        continue
+
+    train_model(run.config)
+```
+
+Or as a generator expression:
+
+```python
+wanted = (run for run in sweep if run.params["training.lr"] < 0.1)
+```
+
+`sweep` is a re-iterable sequence, so you can loop over it more than once, index it (`sweep[0]`, `sweep[-1]`), and
+slice it (`sweep[:3]`). Each access creates a fresh `Run`; keep a reference to a run if you'll read its config more than
+once. A `Run` can be pickled (for example, to send to a worker process); its config is composed and carried along.
 
 ### Using Sweep Files
 
@@ -81,21 +117,23 @@ parameters:
 Then use it in your code:
 
 ```python
-# Load sweep from file
-runs = generate_sweep_configs(
+sweep = generate_sweep_configs(
     overrides=["+sweeps=experiment"],
-    config_dir="path/to/config"
+    config_dir="path/to/config",
 )
 
-# This generates 5 trials × 3 competitions × 3 models = 45 runs
-print(f"Total runs: {len(runs.runs)}")  # 45
+# 5 trials × 3 competitions × 3 models = 45 runs
+print(len(sweep))  # 45
 
-# All runs share the same scalar values
-for run in runs.runs:
+# Swept parameters are in sweep.axes; fixed ones are not, but every run's params include both
+print(sweep.axes.keys())       # dict_keys(['trial', 'competition', 'agent.code.model'])
+print(sweep[0].params["limits.steps"])  # 500
+
+for run in sweep:
+    if run.params["agent.code.model"] == "o1" and run.params["trial"] > 2:
+        continue  # e.g. only 3 trials for the most expensive model
     assert run.config.limits.steps == 500
-    assert run.config.agent.code.temp == 1.0
-    # But have different sweep parameter values
-    print(f"Trial {run.config.trial}, Model: {run.config.agent.code.model}")
+    print(f"Trial {run.params['trial']}, Model: {run.params['agent.code.model']}")
 ```
 
 ### Combining Sweep Files with Overrides
@@ -103,16 +141,16 @@ for run in runs.runs:
 You can combine sweep files with additional command-line overrides:
 
 ```python
-runs = generate_sweep_configs(
+sweep = generate_sweep_configs(
     overrides=[
         "+sweeps=experiment",  # Load base sweep
-        "optimizer=adam,sgd"    # Add another sweep dimension
+        "optimizer=adam,sgd",  # Add another sweep dimension
     ],
-    config_dir="path/to/config"
+    config_dir="path/to/config",
 )
 
 # Now: 45 runs × 2 optimizers = 90 runs
-print(f"Total runs: {len(runs.runs)}")  # 90
+print(len(sweep))  # 90
 ```
 
 ## Development
