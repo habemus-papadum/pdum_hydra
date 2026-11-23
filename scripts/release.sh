@@ -252,10 +252,59 @@ def update_version_files() -> None:
     )
 
 
+def restore_version_files() -> None:
+    """Put the version files and the lockfile back to the last commit."""
+    subprocess.run(
+        ["git", "checkout", "--", str(PYPROJECT_TOML), str(INIT_PY), "uv.lock"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+
+def lock_version_only(description: str) -> None:
+    """Run `uv lock` and require that it changed nothing but this project's own version.
+
+    A version bump changes exactly one line of uv.lock. `uv lock` can do more than that: when
+    it cannot read a package index it either fails, or quietly settles for older versions of
+    other packages. In both cases the release stops here and the version files and lockfile
+    are restored, so the checkout is left clean and nothing wrong can be committed.
+    """
+    console.print("[dim]→ Running:[/dim] uv lock")
+    result = subprocess.run(["uv", "lock"], cwd=REPO_ROOT, capture_output=True, text=True)
+    problem = None
+    if result.returncode != 0:
+        problem = "uv lock failed."
+        # The resolver's explanation can run to hundreds of lines; the cause is in the hints at the end.
+        lines = result.stderr.splitlines()
+        first_hint = next((i for i, line in enumerate(lines) if line.strip().startswith("hint:")), None)
+        shown = lines[-15:] if first_hint is None else lines[:2] + ["  ..."] + lines[first_hint:]
+        console.print("\n".join(shown), markup=False, highlight=False)
+    else:
+        numstat = subprocess.run(
+            ["git", "diff", "--numstat", "--", "uv.lock"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        if numstat and numstat[:2] != ["1", "1"]:
+            problem = (
+                f"uv lock re-resolved other packages: uv.lock gained {numstat[0]} and lost {numstat[1]} lines, "
+                "but a version bump changes exactly one."
+            )
+    if problem:
+        restore_version_files()
+        console.print(f"[red]✗ ERROR:[/red] {problem}")
+        console.print("The version files and uv.lock are restored to the last commit.")
+        console.print("Run [bold]uv lock[/bold] by hand to see the full output.")
+        sys.exit(1)
+    console.print(f"[green]✓[/green] {description}")
+
+
 def update_lockfile() -> None:
     """Update uv.lock to reflect version changes in pyproject.toml."""
     console.rule("[bold blue]Updating Lockfile")
-    run_command(["uv", "lock"], "Updating uv.lock with new version")
+    lock_version_only("Updated uv.lock with the new version")
 
 
 def create_release_commit() -> None:
@@ -374,7 +423,7 @@ def update_to_dev_version() -> None:
 def update_lockfile_dev() -> None:
     """Update uv.lock with dev version."""
     console.rule("[bold blue]Updating Lockfile (Dev Version)")
-    run_command(["uv", "lock"], "Updating uv.lock with new dev version")
+    lock_version_only("Updated uv.lock with the new dev version")
 
 
 def create_dev_commit() -> None:
@@ -552,6 +601,44 @@ STEPS: list[Step] = [
 ]
 
 
+# Steps that change nothing outside this checkout. `--testing` runs them and then restores the files.
+DRY_RUN_STEPS = (
+    "check_git_clean",
+    "read_version",
+    "validate_alpha",
+    "calculate_release",
+    "run_linting",
+    "run_tests",
+    "update_version",
+    "update_lockfile",
+    "calc_next_dev",
+    "update_dev_version",
+    "update_lockfile_dev",
+)
+
+
+def run_dry_run() -> None:
+    """Run the local steps of a release, then put the checkout back as it was.
+
+    Nothing is committed, tagged, pushed or published. This exercises the checks, both version
+    updates and both lockfile updates, which is where a release can fail before it starts.
+    """
+    steps = [step for step in STEPS if step.id in DRY_RUN_STEPS]
+    try:
+        for i, step in enumerate(steps, 1):
+            console.print(f"\n[bold cyan]Dry run {i}/{len(steps)}:[/bold cyan] {step.name}")
+            step.action()
+    finally:
+        if ctx.current_version:  # the checkout was clean when the run started
+            restore_version_files()
+            console.print("\n[green]✓[/green] Version files and uv.lock restored.")
+    console.print(
+        f"[green]✓[/green] Dry run passed: {ctx.current_version} would release as "
+        f"[bold]{ctx.release_version}[/bold], then become {ctx.next_dev_version}. "
+        "Nothing was committed, tagged, pushed or published."
+    )
+
+
 def show_step_selector() -> list[Step]:
     """Show interactive step selector and return selected steps."""
     console.print()
@@ -614,7 +701,8 @@ def main() -> None:
     parser.add_argument(
         "--testing",
         action="store_true",
-        help="Testing/dry-run mode that skips any operations pushing to git remotes or publishing releases",
+        help="Dry run: run the checks and both version and lockfile updates, then restore the files. "
+        "Nothing is committed, tagged, pushed or published.",
     )
     args = parser.parse_args()
 
@@ -631,8 +719,8 @@ def main() -> None:
     console.print(title)
 
     if ctx.testing:
-        console.print("[yellow]Testing mode enabled: skipping interactive release flow and all remote/publish actions.[/yellow]")
-        console.print("[green]✓[/green] No release steps were executed.")
+        console.print("[yellow]Dry run: local steps only; nothing is committed, tagged, pushed or published.[/yellow]")
+        run_dry_run()
         sys.exit(0)
 
     # Show acknowledgment guard
