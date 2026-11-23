@@ -628,6 +628,6 @@ def generate_sweep_configs(
     return _build_sweep(ctx, base_cfg, sweep_location)
 
 
-__version__ = "0.5.0-alpha"
+__version__ = "0.5.0"
 
 __all__ = ["__version__", "compose", "find_config_dirs", "generate_sweep_configs", "Run", "Sweep"]
