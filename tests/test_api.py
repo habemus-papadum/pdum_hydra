@@ -657,7 +657,7 @@ class TestAPIExports:
 
         assert hasattr(hydra, "__all__")
 
-        expected_exports = {"__version__", "generate_sweep_configs", "Run", "Sweep"}
+        expected_exports = {"__version__", "compose", "find_config_dirs", "generate_sweep_configs", "Run", "Sweep"}
         actual_exports = set(hydra.__all__)
 
         assert expected_exports == actual_exports
