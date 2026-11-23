@@ -24,6 +24,9 @@ Or using uv:
 uv pip install habemus-papadum-hydra
 ```
 
+This version requires Hydra 1.4, which is a release candidate at the time of writing. The dependency names the release
+candidate, so installers select it without an extra flag.
+
 ## Usage
 
 ### The mental model
@@ -151,6 +154,82 @@ sweep = generate_sweep_configs(
 
 # Now: 45 runs × 2 optimizers = 90 runs
 print(len(sweep))  # 90
+```
+
+### Composing One Config
+
+`compose` builds a single config, with no sweep:
+
+```python
+from pdum.hydra import compose
+
+cfg = compose(
+    overrides=["training.lr=0.01", "model=resnet"],
+    config_dir="path/to/config",
+)
+print(cfg.training.lr)  # 0.01
+```
+
+Neither `compose` nor `generate_sweep_configs` uses Hydra's global state. Hydra's own `initialize` functions install a
+process-wide singleton, so they cannot be nested or called from two threads at once. These two functions can be called
+from several threads, inside a running Hydra application, and again later. Each call reads the files again, which is how
+a long-running process reloads its config.
+
+### Several Config Directories
+
+`config_dir` accepts one directory or an ordered list. Hydra looks each file up by name along the list, and the first
+directory that has it wins. A config next to an experiment can then replace part of a shared config:
+
+```text
+experiments/config/base.yaml                     shared values; chooses model: small
+experiments/config/model/small.yaml
+experiments/config/model/big.yaml
+experiments/alice/trial/config/config.yaml       the experiment's own values
+experiments/alice/trial/config/model/big.yaml    replaces the shared big.yaml
+```
+
+```python
+cfg = compose(config_dir=["experiments/alice/trial/config", "experiments/config"])
+```
+
+Two files with the same name are not merged: the nearer one is used and the other is ignored. To layer values, give the
+shared file its own name and list it in the nearer file's defaults:
+
+```yaml
+# experiments/alice/trial/config/config.yaml
+defaults:
+  - base        # found in experiments/config
+  - _self_
+lookback_days: 60
+```
+
+`find_config_dirs` builds the list. It walks upward from a file or directory to the root of the repository and collects
+every `config` directory on the way, nearest first:
+
+```python
+from pdum.hydra import compose, find_config_dirs
+
+cfg = compose(config_dir=find_config_dirs(__file__))
+```
+
+Pass `stop=` to end the walk at another directory, and `name=` if your config directories are not called `config`. An
+entry that contains `://` is passed to Hydra as a config source, so `"pkg://my_app.conf"` adds configs shipped inside a
+Python package. Sweeps accept the same list: `generate_sweep_configs(config_dir=find_config_dirs(__file__))`.
+
+### Building Objects Named in a Config
+
+A composed config works with Hydra's `instantiate`. Hydra 1.4 asks the calling code to name the targets it allows:
+
+```yaml
+# config/store/local.yaml
+_target_: my_app.stores.LocalStore
+root: /data
+```
+
+```python
+from hydra.utils import instantiate
+
+store = instantiate(cfg.store, _execution_whitelist_="my_app.*")
 ```
 
 ## Development

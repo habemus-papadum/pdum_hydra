@@ -11,17 +11,24 @@ A sweep is a grid: it has **axes** (each swept parameter and its values) and **r
 
 Runs are produced lazily and a run's config is composed only when first accessed, so
 large sweeps can be filtered cheaply on ``run.params`` before any config is built.
+
+:func:`compose` builds one config without a sweep. Both it and :func:`generate_sweep_configs`
+accept one config directory or an ordered list of them, and neither touches Hydra's global
+state, so they can be called from several threads, while another Hydra context is open, or
+again later to reload a config from disk.
 """
 
 import itertools
 import math
+import os
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from functools import cached_property, partial
+from pathlib import Path
 from typing import Any, List, overload
 
-from hydra import initialize_config_dir
-from hydra.core.global_hydra import GlobalHydra
+from hydra._internal.config_loader_impl import ConfigLoaderImpl
+from hydra._internal.utils import create_config_search_path_from_sources
 from hydra.core.override_parser.overrides_parser import OverridesParser
 from hydra.core.override_parser.types import OverrideType, ValueType
 from hydra.errors import HydraException
@@ -43,6 +50,9 @@ Pre-requisites:  Read hydra manual and codebase, grok the concepts of `overrides
 
 # One choice along one dimension of the sweep: (hydra override string, params key, typed value).
 _Choice = tuple[str, str, Any]
+
+# One config directory, or several in lookup order (the first directory that has a file wins).
+ConfigDirs = str | os.PathLike | Sequence[str | os.PathLike]
 
 
 class Run:
@@ -314,11 +324,187 @@ def _build_sweep(ctx: HydraContext, cfg: DictConfig, sweep_location="sweeps") ->
     return Sweep(cfg, axes, dimensions, partial(render_sweep_config, ctx, cfg))
 
 
+def _config_source(entry: str | os.PathLike) -> str:
+    """Turn one ``config_dir`` entry into a Hydra config source URI."""
+    text = os.fspath(entry)
+    if "://" in text:  # already a source, e.g. "pkg://my_app.conf"
+        return text
+    path = Path(text).resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(f"Config directory does not exist: {path}")
+    return f"file://{path}"
+
+
+def _config_loader(config_dir: ConfigDirs) -> ConfigLoaderImpl:
+    """
+    Build a Hydra config loader over one or more config directories.
+
+    Hydra's ``initialize_*`` functions do the same and then install the result in a process-wide
+    singleton, which is why they cannot be nested, called from two threads at once, or called
+    inside a running ``@hydra.main`` application. A loader needs only a search path, so this
+    builds the search path the way Hydra does and stops there.
+    """
+    entries = [config_dir] if isinstance(config_dir, (str, os.PathLike)) else list(config_dir)
+    if not entries:
+        raise ValueError("config_dir needs at least one directory")
+    sources = [_config_source(entry) for entry in entries]
+    return ConfigLoaderImpl(config_search_path=create_config_search_path_from_sources(sources))
+
+
+def compose(
+    *,
+    overrides: Sequence[str] | None = None,
+    config_name: str = "config",
+    config_dir: ConfigDirs = "config",
+) -> DictConfig:
+    """
+    Compose one Hydra configuration, without Hydra's global state.
+
+    This is Hydra's ``compose`` for a config on disk, in one call: no ``initialize`` context is
+    needed and none is disturbed. It is safe to call from several threads, inside a running
+    Hydra application, and repeatedly: each call reads the files again, so calling it again is
+    how a long-running process reloads its config.
+
+    Parameters
+    ----------
+    overrides : sequence of str, optional
+        Hydra override strings, e.g. ``["training.lr=0.01", "model=resnet"]``. Sweep syntax
+        (``lr=0.01,0.1``) is rejected here; use :func:`generate_sweep_configs` for sweeps.
+    config_name : str, optional
+        Name of the primary config file, without extension. Default is "config".
+    config_dir : str, Path, or sequence of them, optional
+        The config directory, or several in lookup order. A relative path is resolved against
+        the current working directory. An entry containing ``://`` is passed to Hydra as a
+        config source, e.g. ``"pkg://my_app.conf"`` for configs shipped inside a package.
+
+    Returns
+    -------
+    DictConfig
+        The composed config, without the ``hydra`` node.
+
+    Raises
+    ------
+    FileNotFoundError
+        If a config directory does not exist.
+
+    Notes
+    -----
+    With several directories Hydra looks each file up by name along the list, and the first
+    directory that has it wins. So a nearer directory can replace one option of a config group
+    (``model/big.yaml``) while the other options still come from a later directory.
+
+    Two files with the same name are **not** merged. To layer values, give the shared file its
+    own name and list it in the nearer file's defaults::
+
+        # shared/base.yaml                  # experiment/config.yaml
+        defaults:                           defaults:
+          - model: small                      - base
+          - _self_                            - _self_
+        lookback_days: 20                   lookback_days: 60
+
+    Composed with ``config_dir=[experiment, shared]``, the result takes ``lookback_days: 60``
+    from the experiment and everything else from ``base``.
+
+    Examples
+    --------
+    >>> cfg = compose(overrides=["training.lr=0.01"], config_dir="/path/to/config")
+    >>> cfg.training.lr
+    0.01
+
+    >>> # Nearest directory first
+    >>> cfg = compose(config_dir=["/exp/trial_a/config", "/exp/config"])
+
+    >>> # Build an object named in the config (Hydra 1.4 asks the caller for the allowed targets)
+    >>> from hydra.utils import instantiate
+    >>> store = instantiate(cfg.store, _execution_whitelist_="my_app.*")
+    """
+    loader = _config_loader(config_dir)
+    cfg = loader.load_configuration(
+        config_name=config_name,
+        overrides=list(overrides or []),
+        run_mode=RunMode.RUN,
+        from_shell=False,
+    )
+    with open_dict(cfg):
+        del cfg["hydra"]
+    return cfg
+
+
+def find_config_dirs(
+    start: str | os.PathLike,
+    *,
+    name: str = "config",
+    stop: str | os.PathLike | None = None,
+) -> list[Path]:
+    """
+    Collect the config directories at and above a starting point, nearest first.
+
+    Walks from ``start`` up to ``stop`` and returns every existing ``<directory>/<name>``.
+    The result is ready to pass as ``config_dir`` to :func:`compose` or
+    :func:`generate_sweep_configs`: a config near the starting point then overrides the
+    shared ones above it.
+
+    Parameters
+    ----------
+    start : str or Path
+        Where to start: a directory, or a file (its directory is used), e.g. ``__file__``.
+    name : str, optional
+        Name of the config directory to look for at each level. Default is "config".
+    stop : str or Path, optional
+        The last directory to look in. It must be ``start``'s directory or one of its parents.
+        Default is the root of the repository that contains ``start`` (the nearest directory
+        that has a ``.git`` entry).
+
+    Returns
+    -------
+    list of Path
+        The directories found, nearest first. Empty if there are none.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``start`` does not exist.
+    ValueError
+        If ``stop`` is not given and ``start`` is not inside a repository, or if ``stop`` is
+        not ``start``'s directory or one of its parents.
+
+    Examples
+    --------
+    >>> # repo/experiments/config/  and  repo/experiments/alice/trial_a/config/
+    >>> dirs = find_config_dirs("repo/experiments/alice/trial_a/run.py")
+    >>> [str(d) for d in dirs]
+    ['.../experiments/alice/trial_a/config', '.../experiments/config']
+    >>> cfg = compose(config_dir=dirs)
+    """
+    here = Path(start).resolve()
+    if not here.exists():
+        raise FileNotFoundError(f"Starting point does not exist: {here}")
+    if here.is_file():
+        here = here.parent
+    levels = [here, *here.parents]
+    if stop is None:
+        last = next((level for level in levels if (level / ".git").exists()), None)
+        if last is None:
+            raise ValueError(f"{here} is not inside a repository; pass stop= to say where the search ends")
+    else:
+        last = Path(stop).resolve()
+        if last not in levels:
+            raise ValueError(f"stop must be {here} or one of its parents, got {last}")
+    found = []
+    for level in levels:
+        candidate = level / name
+        if candidate.is_dir():
+            found.append(candidate)
+        if level == last:
+            break
+    return found
+
+
 def generate_sweep_configs(
     *,
     overrides=None,
     config_name="config",
-    config_dir="config",
+    config_dir: ConfigDirs = "config",
     sweep_location=DEFAULT_SWEEP_LOCATION,
 ) -> Sweep:
     """
@@ -338,8 +524,9 @@ def generate_sweep_configs(
         To use sweep files, include "+sweeps=<sweep_name>" in overrides.
     config_name : str, optional
         Name of the config file (without extension) to load. Default is "config".
-    config_dir : str or Path, optional
-        Directory containing Hydra configuration files. Default is "config".
+    config_dir : str, Path, or sequence of them, optional
+        The config directory, or several in lookup order (the first directory that has a
+        file wins); see :func:`compose`. Default is "config".
     sweep_location : str, optional
         Config path where sweep parameters are defined. Default is "sweeps".
 
@@ -353,9 +540,14 @@ def generate_sweep_configs(
     ------
     HydraException
         If an override uses a non-discrete sweep (e.g. ``range`` or ``interval``).
+    FileNotFoundError
+        If a config directory does not exist.
 
     Notes
     -----
+    Like :func:`compose`, this does not use Hydra's global state, so it can be called while
+    another Hydra context is open and from several threads.
+
     Sweep files provide a powerful way to define parameter sweeps. Place YAML
     files in the `{config_dir}/sweeps/` directory with a `parameters` section.
 
@@ -424,19 +616,18 @@ def generate_sweep_configs(
     >>> len(sweep)  # 30 × 2 optimizers = 60
     60
     """
-    if overrides is None:
-        overrides = []
-    with initialize_config_dir(config_dir=str(config_dir), job_name="generate_sweep_configs", version_base=None):
-        gh = GlobalHydra.instance()
-        cb = Callback()
-        ctx = HydraContext(gh.config_loader(), cb)
-        base_cfg = gh.hydra.compose_config(config_name=config_name, overrides=overrides, run_mode=RunMode.MULTIRUN)
-        # Runs compose their configs lazily, after this `with` block has exited. That works because
-        # the config loader captured in `ctx` keeps its own config repository and doesn't need
-        # Hydra's global state.
-        return _build_sweep(ctx, base_cfg, sweep_location)
+    loader = _config_loader(config_dir)
+    ctx = HydraContext(loader, Callback())
+    base_cfg = loader.load_configuration(
+        config_name=config_name,
+        overrides=list(overrides or []),
+        run_mode=RunMode.MULTIRUN,
+    )
+    # Runs compose their configs lazily, from the same loader. It keeps its own config
+    # repository and needs none of Hydra's global state.
+    return _build_sweep(ctx, base_cfg, sweep_location)
 
 
 __version__ = "0.5.0-alpha"
 
-__all__ = ["__version__", "generate_sweep_configs", "Run", "Sweep"]
+__all__ = ["__version__", "compose", "find_config_dirs", "generate_sweep_configs", "Run", "Sweep"]
